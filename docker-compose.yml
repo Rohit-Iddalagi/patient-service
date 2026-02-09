@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: patient_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hospital_patient_db
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hospital_network
+
+  mysql:
+    image: mysql:8.0
+    container_name: patient_db_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: hospital_patient_db
+      MYSQL_USER: patient_user
+      MYSQL_PASSWORD: postgres
+    ports:
+      - '3306:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hospital_network
+
+  patient-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: patient_service
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      SERVICE_NAME: patient-service
+      DB_DIALECT: ${DB_DIALECT:-postgres}
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-hospital_patient_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key}
+      API_PREFIX: /api/v1
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - hospital_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: patient_cache
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    networks:
+      - hospital_network
+
+volumes:
+  postgres_data:
+  mysql_data:
+  redis_data:
+
+networks:
+  hospital_network:
+    driver: bridge
