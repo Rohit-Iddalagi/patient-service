@@ -1,7 +1,9 @@
 const request = require('supertest');
 const app = require('../src/index');
+const runDbTests = process.env.RUN_DB_TESTS === 'true';
+const describeIfDb = runDbTests ? describe : describe.skip;
 
-describe('Patient API', () => {
+describeIfDb('Patient API', () => {
   let patientId;
 
   // Create patient
