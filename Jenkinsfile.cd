@@ -11,6 +11,8 @@ pipeline {
     string(name: 'ECR_REPOSITORY', defaultValue: 'patientservice', description: 'ECR repository name')
     string(name: 'ECS_CLUSTER', defaultValue: 'hospital-management-prod-cluster', description: 'ECS cluster name')
     string(name: 'ECS_SERVICE', defaultValue: 'patient-service', description: 'ECS service name')
+    string(name: 'HEALTHCHECK_PATH', defaultValue: '/api/v1/health', description: 'HTTP path for post-deploy smoke test')
+    booleanParam(name: 'RUN_DB_MIGRATION', defaultValue: false, description: 'Run npm run db:migrate in a one-off ECS task after deploy')
     string(name: 'UPSTREAM_GIT_COMMIT', defaultValue: '', description: 'Commit SHA from CI trigger')
     string(name: 'UPSTREAM_GIT_BRANCH', defaultValue: 'main', description: 'Branch from CI trigger')
   }
@@ -102,6 +104,90 @@ pipeline {
               --cluster ${CLUSTER} \
               --services ${SERVICE} \
               --region ${REGION}
+          '''
+        }
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-jenkins'
+        ]]) {
+          sh '''
+            REGION="${AWS_REGION:-us-east-1}"
+            CLUSTER="${ECS_CLUSTER:-hospital-management-prod-cluster}"
+            SERVICE="${ECS_SERVICE:-patient-service}"
+            HEALTH_PATH="${HEALTHCHECK_PATH:-/api/v1/health}"
+
+            TG_ARN=$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${REGION}" --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+            LB_ARN=$(aws elbv2 describe-target-groups --target-group-arns "${TG_ARN}" --region "${REGION}" --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)
+            ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "${LB_ARN}" --region "${REGION}" --query 'LoadBalancers[0].DNSName' --output text)
+            URL="http://${ALB_DNS}${HEALTH_PATH}"
+            echo "${URL}" > reports/smoke-url.txt
+
+            for i in $(seq 1 18); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "${URL}" || true)
+              if [ "${code}" -ge 200 ] && [ "${code}" -lt 400 ]; then
+                echo "Smoke test passed with HTTP ${code}"
+                exit 0
+              fi
+              sleep 10
+            done
+
+            echo "Smoke test failed for ${URL}"
+            exit 1
+          '''
+        }
+      }
+    }
+
+    stage('Run DB Migration') {
+      when {
+        expression { return params.RUN_DB_MIGRATION == true }
+      }
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-jenkins'
+        ]]) {
+          sh '''
+            REGION="${AWS_REGION:-us-east-1}"
+            CLUSTER="${ECS_CLUSTER:-hospital-management-prod-cluster}"
+            SERVICE="${ECS_SERVICE:-patient-service}"
+
+            TASK_DEF=$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${REGION}" --query 'services[0].taskDefinition' --output text)
+            SUBNETS=$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${REGION}" --query 'services[0].networkConfiguration.awsvpcConfiguration.subnets' --output text)
+            SGS=$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${REGION}" --query 'services[0].networkConfiguration.awsvpcConfiguration.securityGroups' --output text)
+            SUBNET_CSV=$(echo "${SUBNETS}" | tr '\\t' ',')
+            SG_CSV=$(echo "${SGS}" | tr '\\t' ',')
+
+            TASK_ARN=$(aws ecs run-task \
+              --cluster "${CLUSTER}" \
+              --launch-type FARGATE \
+              --task-definition "${TASK_DEF}" \
+              --region "${REGION}" \
+              --network-configuration "awsvpcConfiguration={subnets=[${SUBNET_CSV}],securityGroups=[${SG_CSV}],assignPublicIp=ENABLED}" \
+              --overrides '{"containerOverrides":[{"name":"patient-service","command":["npm","run","db:migrate"]}]}' \
+              --query 'tasks[0].taskArn' \
+              --output text)
+
+            if [ -z "${TASK_ARN}" ] || [ "${TASK_ARN}" = "None" ]; then
+              echo "Failed to start migration task"
+              exit 1
+            fi
+
+            aws ecs wait tasks-stopped --cluster "${CLUSTER}" --tasks "${TASK_ARN}" --region "${REGION}"
+            EXIT_CODE=$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${TASK_ARN}" --region "${REGION}" --query "tasks[0].containers[?name=='patient-service'].exitCode | [0]" --output text)
+
+            if [ "${EXIT_CODE}" != "0" ]; then
+              REASON=$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${TASK_ARN}" --region "${REGION}" --query "tasks[0].stoppedReason" --output text)
+              echo "Migration failed. Stopped reason: ${REASON}"
+              exit 1
+            fi
+
+            echo "Migration completed successfully"
           '''
         }
       }
