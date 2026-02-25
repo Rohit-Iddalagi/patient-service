@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
 
+COPY .sequelizerc ./
 COPY src ./src
 
 EXPOSE 3001
