@@ -61,7 +61,12 @@ pipeline {
         timeout(time: 15, unit: 'MINUTES')
       }
       steps {
-        sh 'npm test -- --ci'
+        sh '''
+          ( while true; do echo "[keepalive] $(date -u +%FT%TZ) patient-service tests running..."; sleep 30; done ) &
+          KEEPALIVE_PID=$!
+          trap 'kill ${KEEPALIVE_PID} >/dev/null 2>&1 || true' EXIT
+          npm test -- --ci --runInBand
+        '''
       }
     }
 
